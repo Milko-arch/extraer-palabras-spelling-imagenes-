@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Extractor de Palabras Numeradas y Capítulos</title>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Google Fonts: Inter & Outfit -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
+  <!-- React & Babel CDNs -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- FontAwesome Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <!-- Tesseract.js for offline fallback -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'sans-serif'],
+            display: ['Outfit', 'sans-serif'],
+          },
+          colors: {
+            brand: {
+              50: '#f0f7ff',
+              100: '#e0effe',
+              500: '#3b82f6',
+              600: '#2563eb',
+              700: '#1d4ed8',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    body { font-family: 'Inter', sans-serif; }
+    .font-display { font-family: 'Outfit', sans-serif; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 9999px; }
+    .dark ::-webkit-scrollbar-thumb { background: #475569; }
+  </style>
+</head>
+<body class="bg-slate-50 dark:bg-slate-900 text-slate-800 dark:text-slate-100 min-h-screen transition-colors duration-200">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // Helper for exponential backoff retries with Gemini API
+    const fetchWithBackoff = async (url, options, maxRetries = 3) => {
+      let delay = 1000;
+      for (let i = 0; i < maxRetries; i++) {
+        try {
+          const response = await fetch(url, options);
+          if (response.status === 429 || response.status >= 500) {
+            if (i === maxRetries - 1) throw new Error(`Error de conexión con IA (${response.status})`);
+            await new Promise(res => setTimeout(res, delay));
+            delay *= 2;
+            continue;
+          }
+          return response;
+        } catch (err) {
+          if (i === maxRetries - 1) throw err;
+          await new Promise(res => setTimeout(res, delay));
+          delay *= 2;
+        }
+      }
+    };
+
+    // Helper safely copying text using standard document execution
+    const copyToClipboard = (text) => {
+      try {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.style.position = 'fixed';
+        textarea.style.left = '-9999px';
+        textarea.style.top = '-9999px';
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        const successful = document.execCommand('copy');
+        document.body.removeChild(textarea);
+        return successful;
+      } catch (err) {
+        console.error('Error al copiar:', err);
+        return false;
+      }
+    };
+
+    function App() {
+      const [images, setImages] = useState([]);
+      const [customApiKey, setCustomApiKey] = useState('');
+      const [showApiKeyInput, setShowApiKeyInput] = useState(false);
+      const [isProcessingAll, setIsProcessingAll] = useState(false);
+      const [toast, setToast] = useState(null);
+      const [separator, setSeparator] = useState('newline'); // 'newline', 'comma', 'space', 'numbered'
+      const [casing, setCasing] = useState('original'); // 'original', 'lowercase', 'uppercase', 'capitalize'
+      const [removeDuplicates, setRemoveDuplicates] = useState(false);
+      const [sortAlphabetical, setSortAlphabetical] = useState(false);
+      const [includeChapterHeader, setIncludeChapterHeader] = useState(true);
+      const fileInputRef = useRef(null);
+
+      const showToast = (message, type = 'info') => {
+        setToast({ message, type });
+        setTimeout(() => setToast(null), 3500);
+      };
+
+      const handleFileSelect = (e) => {
+        const files = Array.from(e.target.files || []);
+        addFilesToState(files);
+      };
+
+      const addFilesToState = (files) => {
+        const imageFiles = files.filter(file => file.type.startsWith('image/'));
+        if (imageFiles.length === 0) {
+          showToast('Por favor selecciona solo archivos de imagen (JPG, PNG, WEBP, etc.)', 'warning');
+          return;
+        }
+
+        setImages(prev => {
+          const currentCount = prev.length;
+          const newItems = imageFiles.map((file, idx) => ({
+            id: Math.random().toString(36).substring(2, 9),
+            file,
+            previewUrl: URL.createObjectURL(file),
+            status: 'idle', // 'idle' | 'processing' | 'done' | 'error'
+            engineUsed: null,
+            chapter: `Capítulo ${currentCount + idx + 1}`,
+            rawWords: [],
+            errorMsg: '',
+          }));
+          return [...prev, ...newItems];
+        });
+      };
+
+      const updateChapter = (id, newChapter) => {
+        setImages(prev => prev.map(img => img.id === id ? { ...img, chapter: newChapter } : img));
+      };
+
+      const handleDragOver = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      };
+
+      const handleDrop = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+          addFilesToState(Array.from(e.dataTransfer.files));
+        }
+      };
+
+      const removeImage = (id) => {
+        setImages(prev => prev.filter(img => img.id !== id));
+      };
+
+      const clearAll = () => {
+        setImages([]);
+      };
+
+      const processWithLocalOcr = async (imgObj) => {
+        if (typeof Tesseract === 'undefined') {
+          throw new Error('Librería de OCR local no cargada');
+        }
+
+        const worker = await Tesseract.createWorker('spa');
+        const ret = await worker.recognize(imgObj.file);
+        await worker.terminate();
+
+        const rawText = ret.data.text || '';
+        const lines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+
+        let detectedChapter = null;
+        const extractedWords = [];
+
+        lines.forEach(line => {
+          // Identify chapter / theme headers
+          const chapterMatch = line.match(/^(cap[ií]tulo|tema|secci[oó]n|unidad|parte)\s*([\d\wIVXLCDM\.\-\:\s]+)/i);
+          if (chapterMatch && !detectedChapter) {
+            detectedChapter = line.trim();
+          }
+
+          // Strictly match ONLY numbered lines (e.g., "1. Manzana", "2) Perro", "3 - Texto", "4: Casa", "5º Sol")
+          const numberMatch = line.match(/^(\(?\d+[\.\)\:\-\º\°]?\)?)\s+(.+)/);
+          if (numberMatch && numberMatch[2]) {
+            const wordOnly = numberMatch[2].trim();
+            // Verify word doesn't match a chapter title line
+            if (wordOnly && !wordOnly.match(/^(cap[ií]tulo|tema|secci[oó]n|unidad)/i)) {
+              extractedWords.push(wordOnly);
+            }
+          }
+        });
+
+        return {
+          chapter: detectedChapter,
+          words: extractedWords
+        };
+      };
+
+      const processWithGeminiApi = async (imgObj, apiKeyToUse) => {
+        const base64Data = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result.split(',')[1]);
+          reader.onerror = reject;
+          reader.readAsDataURL(imgObj.file);
+        });
+
+        const promptText = `
+Analiza la imagen de este documento y realiza dos tareas con absoluta precisión:
+
+1. CAPÍTULO / TÍTULO PRINCIPAL:
+   Identifica la cabecera, número de capítulo, tema o sección visible en la parte superior (ejemplos: "Capítulo 1", "Capítulo IV", "Tema 2: Frutas", "Unidad 5").
+   Escribe en la PRIMERA LÍNEA exactamente:
+   CAPITULO: <nombre o número del capítulo>
+   Si no hay ningún número de capítulo o tema explícito en la imagen, escribe "CAPITULO: Ninguno".
+
+2. PALABRAS O FRASES NUMERADAS:
+   Extrae ÚNICAMENTE las palabras, términos o frases que estén NUMERADAS (ejemplos en la imagen: "1. Manzana", "2) Pera", "3 - Sol", "4: Perro").
+   
+   REGLAS STRICTAS PARA LAS PALABRAS:
+   - Elimina COMPLETAMENTE el número y cualquier signo inicial (puntos, paréntesis, guiones, dos puntos, grados).
+   - Extrae solo el texto limpio (por ejemplo: si dice "1. Manzana", extrae sólo "Manzana").
+   - NO incluyas subtítulos, notas o textos que NO tengan un número ordinal o correlativo asignado.
+   - Conserva el orden original.
+   - Escribe cada palabra o frase extraída en una nueva línea a partir de la segunda línea.
+`;
+
+        const apiKey = apiKeyToUse || '';
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`;
+
+        const payload = {
+          contents: [{
+            role: "user",
+            parts: [
+              { text: promptText },
+              { inlineData: { mimeType: imgObj.file.type || 'image/png', data: base64Data } }
+            ]
+          }]
+        };
+
+        const response = await fetchWithBackoff(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        const data = await response.json();
+        if (data.error) {
+          throw new Error(data.error.message || 'Error en Gemini Vision API');
+        }
+
+        const textOutput = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        const lines = textOutput.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+
+        let detectedChapter = null;
+        const extractedList = [];
+
+        lines.forEach(line => {
+          if (line.toUpperCase().startsWith('CAPITULO:')) {
+            const chapVal = line.replace(/^CAPITULO:\s*/i, '').trim();
+            if (chapVal && chapVal.toLowerCase() !== 'ninguno' && chapVal.toLowerCase() !== 'none' && chapVal.toLowerCase() !== 'sin capítulo') {
+              detectedChapter = chapVal;
+            }
+          } else {
+            // Extra cleaning just in case LLM left a leading number prefix
+            const cleanWord = line.replace(/^(\(?\d+[\.\)\:\-\º\°]?\)?|\*|\-)\s*/, '').trim();
+            if (cleanWord.length > 0) {
+              extractedList.push(cleanWord);
+            }
+          }
+        });
+
+        return { chapter: detectedChapter, words: extractedList };
+      };
+
+      const processSingleImage = async (imageId) => {
+        const imgObj = images.find(img => img.id === imageId);
+        if (!imgObj) return;
+
+        setImages(prev => prev.map(img => img.id === imageId ? { ...img, status: 'processing', errorMsg: '' } : img));
+
+        const apiKey = customApiKey.trim();
+
+        try {
+          // Attempt Gemini Vision first (with runtime or user API Key)
+          const result = await processWithGeminiApi(imgObj, apiKey);
+          setImages(prev => prev.map(img => 
+            img.id === imageId ? { 
+              ...img, 
+              status: 'done', 
+              engineUsed: 'gemini',
+              chapter: result.chapter || img.chapter,
+              rawWords: result.words 
+            } : img
+          ));
+        } catch (err) {
+          console.warn('Error procesando con Gemini IA, intentando OCR Local:', err);
+          
+          try {
+            // Local OCR fallback
+            const localResult = await processWithLocalOcr(imgObj);
+            setImages(prev => prev.map(img => 
+              img.id === imageId ? { 
+                ...img, 
+                status: 'done', 
+                engineUsed: 'tesseract',
+                chapter: localResult.chapter || img.chapter,
+                rawWords: localResult.words 
+              } : img
+            ));
+          } catch (fallbackErr) {
+            setImages(prev => prev.map(img => 
+              img.id === imageId ? { 
+                ...img, 
+                status: 'error', 
+                errorMsg: err.message || 'No se pudo procesar la imagen' 
+              } : img
+            ));
+          }
+        }
+      };
+
+      const processAllImages = async () => {
+        setIsProcessingAll(true);
+        const idleOrErrorImages = images.filter(img => img.status === 'idle' || img.status === 'error');
+        
+        for (const img of idleOrErrorImages) {
+          await processSingleImage(img.id);
+        }
+        setIsProcessingAll(false);
+        showToast('Extracción completada', 'success');
+      };
+
+      const formatWordList = (wordsList) => {
+        let list = [...wordsList];
+
+        if (casing === 'lowercase') {
+          list = list.map(w => w.toLowerCase());
+        } else if (casing === 'uppercase') {
+          list = list.map(w => w.toUpperCase());
+        } else if (casing === 'capitalize') {
+          list = list.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase());
+        }
+
+        if (removeDuplicates) {
+          list = Array.from(new Set(list));
+        }
+
+        if (sortAlphabetical) {
+          list.sort((a, b) => a.localeCompare(b, 'es', { sensitivity: 'base' }));
+        }
+
+        if (separator === 'comma') {
+          return list.join(', ');
+        } else if (separator === 'space') {
+          return list.join(' ');
+        } else if (separator === 'numbered') {
+          return list.map((w, idx) => `${idx + 1}. ${w}`).join('\n');
+        } else {
+          return list.join('\n');
+        }
+      };
+
+      const generateMasterText = () => {
+        const processedImages = images.filter(img => img.rawWords && img.rawWords.length > 0);
+        if (processedImages.length === 0) return '';
+
+        if (includeChapterHeader) {
+          return processedImages.map(img => {
+            const formattedWords = formatWordList(img.rawWords);
+            const chapTitle = img.chapter ? img.chapter : 'Capítulo';
+            return `--- ${chapTitle} ---\n${formattedWords}`;
+          }).join('\n\n');
+        } else {
+          const allExtractedWords = images.flatMap(img => img.rawWords || []);
+          return formatWordList(allExtractedWords);
+        }
+      };
+
+      const formattedMasterText = generateMasterText();
+      const totalWordCount = images.reduce((acc, img) => acc + (img.rawWords ? img.rawWords.length : 0), 0);
+
+      const copyMasterText = () => {
+        if (!formattedMasterText) {
+          showToast('No hay palabras extraídas para copiar', 'warning');
+          return;
+        }
+        const success = copyToClipboard(formattedMasterText);
+        if (success) {
+          showToast('¡Palabras copiadas al portapapeles!', 'success');
+        } else {
+          showToast('No se pudo copiar automáticamente', 'error');
+        }
+      };
+
+      const copySingleImageWords = (rawWords) => {
+        const text = formatWordList(rawWords);
+        if (!text) return;
+        const success = copyToClipboard(text);
+        if (success) {
+          showToast('¡Palabras de la imagen copiadas!', 'success');
+        } else {
+          showToast('Error al copiar', 'error');
+        }
+      };
+
+      const downloadTxt = () => {
+        if (!formattedMasterText) return;
+        const element = document.createElement("a");
+        const file = new Blob([formattedMasterText], {type: 'text/plain;charset=utf-8'});
+        element.href = URL.createObjectURL(file);
+        element.download = "palabras_extraidas.txt";
+        document.body.appendChild(element);
+        element.click();
+        document.body.removeChild(element);
+      };
+
+      return (
+        <div className="max-w-6xl mx-auto px-4 py-8">
+          {/* Header */}
+          <header className="mb-8 border-b border-slate-200 dark:border-slate-800 pb-6 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+            <div>
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-brand-600 text-white flex items-center justify-center shadow-lg shadow-brand-500/20">
+                  <i className="fa-solid font-bold fa-font text-xl"></i>
+                </div>
+                <div>
+                  <h1 className="text-2xl font-bold font-display tracking-tight text-slate-900 dark:text-white">
+                    Extractor de Palabras Numeradas y Capítulos
+                  </h1>
+                  <p className="text-sm text-slate-500 dark:text-slate-400">
+                    Extrae automáticamente el capítulo y únicamente las palabras que van numeradas (sin sus números).
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowApiKeyInput(!showApiKeyInput)}
+                className={`px-3 py-2 text-xs font-medium rounded-lg border transition flex items-center gap-2 ${
+                  customApiKey 
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-300 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-800' 
+                    : 'bg-white text-slate-700 border-slate-300 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700 hover:bg-slate-50'
+                }`}
+                title="Clave personal opcional"
+              >
+                <i className="fa-solid fa-key text-amber-500"></i>
+                {customApiKey ? 'API Key Personal Configurada' : 'Configurar API Key (Opcional)'}
+              </button>
+            </div>
+          </header>
+
+          {showApiKeyInput && (
+            <div className="mb-6 p-4 rounded-xl bg-slate-100 dark:bg-slate-800/80 border border-slate-300 dark:border-slate-700 shadow-sm">
+              <div className="flex items-start justify-between">
+                <div>
+                  <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                    <i className="fa-solid fa-microchip text-brand-500"></i> Clave de API Personal de Gemini (Opcional)
+                  </h3>
+                  <p className="text-xs text-slate-600 dark:text-slate-300 mt-1">
+                    La IA de Gemini se utiliza automáticamente. Si posees tu propia clave de Google AI Studio, puedes pegarla aquí:
+                  </p>
+                </div>
+                <button onClick={() => setShowApiKeyInput(false)} className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">
+                  <i className="fa-solid fa-xmark"></i>
+                </button>
+              </div>
+              <div className="mt-3 flex gap-2">
+                <input
+                  type="password"
+                  placeholder="Pegar API Key personal (AIzaSy...)"
+                  value={customApiKey}
+                  onChange={(e) => setCustomApiKey(e.target.value)}
+                  className="flex-1 px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 focus:outline-none focus:ring-2 focus:ring-brand-500"
+                />
+                <button
+                  onClick={() => {
+                    showToast('Clave personal guardada para esta sesión', 'success');
+                    setShowApiKeyInput(false);
+                  }}
+                  className="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white font-medium text-xs rounded-lg transition"
+                >
+                  Guardar
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Toast Notification Banner */}
+          {toast && (
+            <div className={`fixed top-4 right-4 z-50 px-4 py-3 rounded-xl shadow-xl flex items-center gap-3 text-sm font-medium transition transform translate-y-0 ${
+              toast.type === 'success' ? 'bg-emerald-600 text-white' :
+              toast.type === 'error' ? 'bg-rose-600 text-white' :
+              toast.type === 'warning' ? 'bg-amber-500 text-white' : 'bg-slate-800 text-white'
+            }`}>
+              <i className={`fa-solid ${
+                toast.type === 'success' ? 'fa-circle-check' :
+                toast.type === 'error' ? 'fa-circle-exclamation' :
+                toast.type === 'warning' ? 'fa-triangle-exclamation' : 'fa-info-circle'
+              }`}></i>
+              <span>{toast.message}</span>
+            </div>
+          )}
+
+          {/* Main Grid Layout */}
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <div className="lg:col-span-2 space-y-6">
+
+              {/* Drag and Drop Zone */}
+              <div
+                onDragOver={handleDragOver}
+                onDrop={handleDrop}
+                onClick={() => fileInputRef.current && fileInputRef.current.click()}
+                className="border-2 border-dashed border-slate-300 dark:border-slate-700 hover:border-brand-500 dark:hover:border-brand-500 rounded-2xl p-8 text-center cursor-pointer bg-white dark:bg-slate-800/50 hover:bg-slate-50 dark:hover:bg-slate-800 transition duration-150 group shadow-sm"
+              >
+                <input
+                  type="file"
+                  ref={fileInputRef}
+                  onChange={handleFileSelect}
+                  multiple
+                  accept="image/*"
+                  className="hidden"
+                />
+                <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-brand-50 dark:bg-brand-950/50 text-brand-600 dark:text-brand-400 flex items-center justify-center group-hover:scale-110 transition duration-200">
+                  <i className="fa-solid fa-cloud-arrow-up text-2xl"></i>
+                </div>
+                <h3 className="text-base font-semibold text-slate-800 dark:text-slate-100">
+                  Arrastra tus imágenes aquí o <span className="text-brand-600 dark:text-brand-400 underline">haz clic para seleccionar</span>
+                </h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-2">
+                  Admite imágenes de libros, listas, capturas (PNG, JPG, WEBP).
+                </p>
+              </div>
+
+              {/* Action Bar */}
+              {images.length > 0 && (
+                <div className="flex flex-wrap items-center justify-between gap-4 bg-white dark:bg-slate-800 p-4 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm">
+                  <div className="text-sm font-medium text-slate-600 dark:text-slate-300">
+                    <span className="font-bold text-slate-900 dark:text-white">{images.length}</span> {images.length === 1 ? 'imagen cargada' : 'imágenes cargadas'}
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={clearAll}
+                      className="px-3 py-2 text-xs font-medium text-rose-600 hover:text-rose-700 hover:bg-rose-50 dark:hover:bg-rose-950/30 rounded-lg transition flex items-center gap-1.5"
+                    >
+                      <i className="fa-solid fa-trash-can"></i> Limpiar lista
+                    </button>
+
+                    <button
+                      onClick={processAllImages}
+                      disabled={isProcessingAll || images.every(i => i.status === 'done')}
+                      className={`px-4 py-2 text-xs font-semibold text-white rounded-lg transition shadow flex items-center gap-2 ${
+                        isProcessingAll || images.every(i => i.status === 'done')
+                          ? 'bg-slate-400 cursor-not-allowed'
+                          : 'bg-brand-600 hover:bg-brand-700 shadow-brand-500/20'
+                      }`}
+                    >
+                      {isProcessingAll ? (
+                        <>
+                          <i className="fa-solid fa-spinner animate-spin"></i> Procesando...
+                        </>
+                      ) : (
+                        <>
+                          <i className="fa-solid fa-bolt"></i> Extraer de todas
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* List of Image Cards */}
+              <div className="space-y-4">
+                {images.map((img) => (
+                  <div key={img.id} className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-2xl p-4 shadow-sm flex flex-col md:flex-row gap-4 items-start md:items-center justify-between">
+                    
+                    {/* Thumbnail & Chapter Info */}
+                    <div className="flex items-center gap-4 w-full md:w-5/12">
+                      <div className="relative w-20 h-20 rounded-xl overflow-hidden bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 flex-shrink-0">
+                        <img src={img.previewUrl} alt={img.file.name} className="w-full h-full object-cover" />
+                      </div>
+                      <div className="overflow-hidden flex-1">
+                        <p className="text-sm font-semibold truncate text-slate-800 dark:text-slate-100" title={img.file.name}>
+                          {img.file.name}
+                        </p>
+                        
+                        {/* Extracted / Editable Chapter Label */}
+                        <div className="mt-1.5 flex flex-col gap-1">
+                          <label className="text-[10px] uppercase tracking-wider font-bold text-slate-400">Capítulo detectado:</label>
+                          <div className="flex items-center gap-1.5">
+                            <i className="fa-solid fa-bookmark text-brand-500 text-xs"></i>
+                            <input
+                              type="text"
+                              value={img.chapter || ''}
+                              onChange={(e) => updateChapter(img.id, e.target.value)}
+                              placeholder="Ej: Capítulo 1"
+                              className="text-xs font-semibold text-brand-700 dark:text-brand-300 bg-brand-50 dark:bg-brand-950/60 px-2 py-1 rounded-lg border border-brand-200 dark:border-brand-800/60 focus:outline-none focus:ring-1 focus:ring-brand-500 w-full truncate"
+                              title="Capítulo extraído de la imagen (puedes editarlo si lo deseas)"
+                            />
+                          </div>
+                        </div>
+
+                        {/* Status badges */}
+                        <div className="mt-2 flex flex-wrap items-center gap-1">
+                          {img.status === 'idle' && (
+                            <span className="inline-flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded-md bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300">
+                              <i className="fa-solid fa-clock"></i> Pendiente
+                            </span>
+                          )}
+                          {img.status === 'processing' && (
+                            <span className="inline-flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded-md bg-amber-50 text-amber-600 dark:bg-amber-950/50 dark:text-amber-400 animate-pulse">
+                              <i className="fa-solid fa-spinner animate-spin"></i> Analizando...
+                            </span>
+                          )}
+                          {img.status === 'done' && (
+                            <span className="inline-flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-600 dark:bg-emerald-950/50 dark:text-emerald-400">
+                              <i className="fa-solid fa-check"></i> {img.rawWords.length} palabras extraídas
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Result Preview Box */}
+                    <div className="flex-1 w-full">
+                      {img.status === 'done' && (
+                        <div className="bg-slate-50 dark:bg-slate-900 rounded-xl p-3 border border-slate-200 dark:border-slate-800">
+                          {img.rawWords.length > 0 ? (
+                            <div className="max-h-24 overflow-y-auto text-xs font-mono text-slate-700 dark:text-slate-300 space-y-0.5">
+                              {img.rawWords.map((word, idx) => (
+                                <div key={idx} className="truncate">
+                                  {word}
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="text-xs text-slate-400 italic">No se encontraron palabras numeradas en esta imagen.</p>
+                          )}
+                        </div>
+                      )}
+
+                      {img.status === 'error' && (
+                        <div className="bg-rose-50 dark:bg-rose-950/30 text-rose-700 dark:text-rose-300 p-3 rounded-xl text-xs">
+                          {img.errorMsg || 'No se pudo procesar la imagen.'}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Action Buttons */}
+                    <div className="flex items-center gap-2 self-end md:self-center">
+                      {img.status === 'done' && img.rawWords.length > 0 && (
+                        <button
+                          onClick={() => copySingleImageWords(img.rawWords)}
+                          className="p-2 text-xs font-semibold bg-emerald-50 hover:bg-emerald-100 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300 dark:hover:bg-emerald-900 rounded-lg transition"
+                          title="Copiar solo las palabras de esta imagen"
+                        >
+                          <i className="fa-solid fa-copy"></i>
+                        </button>
+                      )}
+
+                      <button
+                        onClick={() => processSingleImage(img.id)}
+                        disabled={img.status === 'processing'}
+                        className="px-3 py-2 text-xs font-medium bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-700 dark:hover:bg-slate-600 dark:text-slate-200 rounded-lg transition flex items-center gap-1"
+                        title="Procesar o reintentar"
+                      >
+                        <i className={`fa-solid ${img.status === 'processing' ? 'fa-spinner animate-spin' : 'fa-play'}`}></i>
+                        {img.status === 'done' ? 'Re-procesar' : 'Extraer'}
+                      </button>
+
+                      <button
+                        onClick={() => removeImage(img.id)}
+                        className="p-2 text-slate-400 hover:text-rose-500 rounded-lg transition"
+                        title="Eliminar imagen"
+                      >
+                        <i className="fa-solid fa-trash-can"></i>
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+            </div>
+
+            {/* Consolidated Output Section */}
+            <div className="space-y-6">
+              <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-2xl p-6 shadow-sm sticky top-6">
+                
+                <div className="flex items-center justify-between pb-4 border-b border-slate-100 dark:border-slate-700">
+                  <h2 className="text-base font-bold font-display text-slate-900 dark:text-white flex items-center gap-2">
+                    <i className="fa-solid fa-list-check text-brand-600"></i> Palabras Extraídas
+                  </h2>
+                  <span className="text-xs px-2 py-1 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 font-semibold">
+                    {totalWordCount} {totalWordCount === 1 ? 'palabra' : 'palabras'}
+                  </span>
+                </div>
+
+                {/* Formatting Options */}
+                <div className="py-4 border-b border-slate-100 dark:border-slate-700 space-y-3">
+                  <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Opciones de salida</p>
+
+                  <div className="grid grid-cols-2 gap-2 text-xs">
+                    <div>
+                      <label className="block text-slate-600 dark:text-slate-400 mb-1">Separador:</label>
+                      <select
+                        value={separator}
+                        onChange={(e) => setSeparator(e.target.value)}
+                        className="w-full px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-1 focus:ring-brand-500"
+                      >
+                        <option value="newline">Salto de línea (\n)</option>
+                        <option value="comma">Separado por comas (,)</option>
+                        <option value="space">Separado por espacios</option>
+                        <option value="numbered">Volver a numerar (1. 2.)</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-slate-600 dark:text-slate-400 mb-1">Mayús/Minús:</label>
+                      <select
+                        value={casing}
+                        onChange={(e) => setCasing(e.target.value)}
+                        className="w-full px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-1 focus:ring-brand-500"
+                      >
+                        <option value="original">Tal cual está</option>
+                        <option value="lowercase">minúsculas</option>
+                        <option value="uppercase">MAYÚSCULAS</option>
+                        <option value="capitalize">Primera Mayúscula</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* Toggles */}
+                  <div className="flex flex-col gap-2 pt-2 text-xs">
+                    <label className="flex items-center gap-2 cursor-pointer text-slate-700 dark:text-slate-300">
+                      <input
+                        type="checkbox"
+                        checked={includeChapterHeader}
+                        onChange={(e) => setIncludeChapterHeader(e.target.checked)}
+                        className="rounded border-slate-300 text-brand-600 focus:ring-brand-500"
+                      />
+                      <span className="font-semibold text-brand-600 dark:text-brand-400">Incluir el nombre del Capítulo arriba</span>
+                    </label>
+
+                    <label className="flex items-center gap-2 cursor-pointer text-slate-700 dark:text-slate-300">
+                      <input
+                        type="checkbox"
+                        checked={removeDuplicates}
+                        onChange={(e) => setRemoveDuplicates(e.target.checked)}
+                        className="rounded border-slate-300 text-brand-600 focus:ring-brand-500"
+                      />
+                      <span>Eliminar duplicados</span>
+                    </label>
+
+                    <label className="flex items-center gap-2 cursor-pointer text-slate-700 dark:text-slate-300">
+                      <input
+                        type="checkbox"
+                        checked={sortAlphabetical}
+                        onChange={(e) => setSortAlphabetical(e.target.checked)}
+                        className="rounded border-slate-300 text-brand-600 focus:ring-brand-500"
+                      />
+                      <span>Ordenar alfabéticamente (A-Z)</span>
+                    </label>
+                  </div>
+                </div>
+
+                {/* Final Copyable Area */}
+                <div className="pt-4 space-y-3">
+                  <textarea
+                    readOnly
+                    value={formattedMasterText}
+                    placeholder="Aquí aparecerán las palabras extraídas sin números para que puedas copiarlas..."
+                    rows={10}
+                    className="w-full p-3 font-mono text-xs rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 resize-none"
+                  ></textarea>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      onClick={copyMasterText}
+                      disabled={!formattedMasterText}
+                      className={`w-full py-2.5 px-4 rounded-xl text-xs font-bold text-white transition flex items-center justify-center gap-2 shadow ${
+                        formattedMasterText
+                          ? 'bg-emerald-600 hover:bg-emerald-700 shadow-emerald-600/20'
+                          : 'bg-slate-300 dark:bg-slate-700 cursor-not-allowed opacity-60'
+                      }`}
+                    >
+                      <i className="fa-solid fa-copy"></i> Copiar Todo
+                    </button>
+
+                    <button
+                      onClick={downloadTxt}
+                      disabled={!formattedMasterText}
+                      className={`w-full py-2.5 px-4 rounded-xl text-xs font-bold transition flex items-center justify-center gap-2 border ${
+                        formattedMasterText
+                          ? 'border-slate-300 dark:border-slate-600 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200'
+                          : 'border-slate-200 text-slate-400 cursor-not-allowed'
+                      }`}
+                    >
+                      <i className="fa-solid fa-download"></i> Guardar .TXT
+                    </button>
+                  </div>
+                </div>
+
+              </div>
+            </div>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
